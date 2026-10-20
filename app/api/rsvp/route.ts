@@ -1,10 +1,55 @@
-import { env } from 'cloudflare:workers';
 import { getDb } from '../../../db';
-import { confirmations } from '../../../db/schema';
-import { desc } from 'drizzle-orm';
-export async function POST(request:Request){
- if(request.headers.get('origin')!==new URL(request.url).origin)return new Response('Forbidden',{status:403});
- try{const {name,key}=await request.json() as {name?:unknown;key?:unknown};if(typeof name!=='string'||name.trim().length<3||name.trim().length>100||typeof key!=='string'||!/^[0-9a-f-]{36}$/i.test(key))return Response.json({error:'Dados inválidos'},{status:400});await getDb().insert(confirmations).values({id:key,name:name.trim(),createdAt:new Date().toISOString()}).onConflictDoUpdate({target:confirmations.id,set:{name:name.trim()}});return Response.json({ok:true})}catch{return Response.json({error:'Não foi possível salvar'},{status:500})}
-}
-export async function GET(request:Request){const secret=(env as unknown as Record<string,string>).ADMIN_PASSWORD;if(!secret||request.headers.get('authorization')!==`Bearer ${secret}`)return new Response('Acesso restrito',{status:401});const rows=await getDb().select().from(confirmations).orderBy(desc(confirmations.createdAt));return Response.json(rows,{headers:{'Cache-Control':'no-store'}})}
+import { authorized, validateGuest } from '../../../lib/rsvp.mjs';
 
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+const privateHeaders = { 'Cache-Control': 'private, no-store, max-age=0' };
+
+export async function POST(request: Request) {
+  // Next.js can use an internal hostname in request.url behind a hosting proxy.
+  let sameOrigin = false;
+  try {
+    const origin = new URL(request.headers.get('origin') || '');
+    const protocol = request.headers.get('x-forwarded-proto')?.split(',')[0].trim()
+      || new URL(request.url).protocol.replace(':', '');
+    sameOrigin = ['http:', 'https:'].includes(origin.protocol)
+      && origin.host === request.headers.get('host')
+      && origin.protocol === `${protocol}:`;
+  } catch { /* Missing or malformed origins are rejected. */ }
+  if (!sameOrigin) {
+    return Response.json({ error: 'Origem inválida.' }, { status: 403 });
+  }
+  if (!request.headers.get('content-type')?.includes('application/json')) {
+    return Response.json({ error: 'Formato inválido.' }, { status: 415 });
+  }
+  let body: unknown;
+  try {
+    const text = await request.text();
+    if (text.length > 4096) return Response.json({ error: 'Dados muito longos.' }, { status: 413 });
+    body = JSON.parse(text);
+  } catch {
+    return Response.json({ error: 'Dados inválidos.' }, { status: 400 });
+  }
+  const guest = validateGuest(body);
+  if (!guest) return Response.json({ error: 'Informe seu nome completo (3 a 100 caracteres).' }, { status: 400 });
+  if (!process.env.DATABASE_URL) {
+    return Response.json({ error: 'As confirmações ainda não estão disponíveis. Tente novamente mais tarde.' }, { status: 503 });
+  }
+  try {
+    await getDb().save(guest);
+    return Response.json({ ok: true }, { headers: privateHeaders });
+  } catch {
+    return Response.json({ error: 'Não foi possível salvar. Tente novamente em instantes.' }, { status: 503 });
+  }
+}
+
+export async function GET(request: Request) {
+  if (!authorized(request.headers.get('authorization'), process.env.ADMIN_PASSWORD)) {
+    return Response.json({ error: 'Senha incorreta ou acesso não configurado.' }, { status: 401, headers: privateHeaders });
+  }
+  try {
+    return Response.json(await getDb().list(), { headers: privateHeaders });
+  } catch {
+    return Response.json({ error: 'A lista está indisponível. Confira a conexão do banco e tente novamente.' }, { status: 503, headers: privateHeaders });
+  }
+}
